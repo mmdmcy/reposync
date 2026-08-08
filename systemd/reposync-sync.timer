@@ -1,0 +1,9 @@
+[Unit]
+Description=reposync: fetch remote refs every six hours
+
+[Timer]
+OnCalendar=*-*-* 03,09,15,21:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=reposync: warn about stale uncommitted or unpushed work
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%BIN% warn
+Nice=10

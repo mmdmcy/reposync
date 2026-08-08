@@ -1,0 +1,9 @@
+[Unit]
+Description=reposync: hourly stale-work warning (offline, no push, no commit)
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

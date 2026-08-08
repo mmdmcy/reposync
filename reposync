@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# reposync - declarative multi-repo sync and dirty-work guard for the LinuxMice
+# fleet. Never auto-commits and never auto-pushes: it fetches remote refs and
+# warns about work that has not been committed or pushed, so the operator
+# decides what happens.
+
+PROGRAM="reposync"
+VERSION="0.1.0"
+
+CONFIG_FILE="${REPOSYNC_CONFIG:-$HOME/.config/reposync/config}"
+STATE_ROOT="${REPOSYNC_STATE_ROOT:-$HOME/.local/state/reposync}"
+REPO_ROOTS=("$HOME/Documents/github")
+STALE_HOURS=8
+FETCH_MIN_HOURS=6
+NOTIFY_COOLDOWN_HOURS=24
+NOTIFY_COMMAND=""
+
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    [[ -z "$line" ]] && continue
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key//[[:space:]]/}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$key" in
+      repo_root) REPO_ROOTS=("$value") ;;
+      repo_root_append) REPO_ROOTS+=("$value") ;;
+      stale_hours) STALE_HOURS="$value" ;;
+      fetch_min_hours) FETCH_MIN_HOURS="$value" ;;
+      notify_cooldown_hours) NOTIFY_COOLDOWN_HOURS="$value" ;;
+      notify_command) NOTIFY_COMMAND="$value" ;;
+      *) printf '%s: ignoring unknown config key %s\n' "$PROGRAM" "$key" >&2 ;;
+    esac
+  done <"$CONFIG_FILE"
+}
+
+fail() {
+  printf '%s: %s\n' "$PROGRAM" "$*" >&2
+  exit 1
+}
+
+now_epoch() {
+  date +%s
+}
+
+# repo_dirs - print every directory containing a .git across all roots, one
+# per line.
+repo_dirs() {
+  local root dir
+  for root in "${REPO_ROOTS[@]}"; do
+    [[ -d "$root" ]] || continue
+    while IFS= read -r -d '' dir; do
+      printf '%s\n' "${dir%/.git}"
+    done < <(find "$root" -maxdepth 3 -name .git -type d -print0 2>/dev/null | sort -z)
+  done
+}
+
+# last_change_epoch <repo_dir> - newest mtime among tracked-modified and
+# untracked files, or 0 if the worktree is clean.
+last_change_epoch() {
+  local dir="$1" path age newest=0
+  while IFS= read -r item; do
+    path="${item#?? }"
+    [[ -n "$path" && -e "$dir/$path" ]] || continue
+    age="$(stat -c %Y "$dir/$path" 2>/dev/null || echo 0)"
+    (( age > newest )) && newest="$age"
+  done < <(git -C "$dir" status --porcelain 2>/dev/null)
+  printf '%s\n' "$newest"
+}
+
+# upstream_ref <repo_dir> - the configured upstream, or origin/<branch> when
+# the branch has no upstream but the remote ref exists; empty otherwise.
+upstream_ref() {
+  local dir="$1" branch upstream
+  upstream="$(git -C "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)"
+  if [[ -z "$upstream" ]]; then
+    branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    git -C "$dir" rev-parse --verify -q "refs/remotes/origin/$branch" >/dev/null 2>&1 &&
+      upstream="origin/$branch"
+  fi
+  printf '%s\n' "$upstream"
+}
+
+# unpushed_since <repo_dir> - epoch of the newest commit not on the upstream,
+# or 0 when there is nothing to push.
+unpushed_since() {
+  local dir="$1" upstream
+  upstream="$(upstream_ref "$dir")"
+  [[ -n "$upstream" ]] || { printf '0\n'; return; }
+  git -C "$dir" log -1 --format=%ct "$upstream..HEAD" 2>/dev/null || printf '0\n'
+}
+
+# unpushed_count <repo_dir> - number of commits ahead of the upstream, 0 when
+# there is no upstream or nothing to push.
+unpushed_count() {
+  local dir="$1" upstream
+  upstream="$(upstream_ref "$dir")"
+  [[ -n "$upstream" ]] || { printf '0\n'; return; }
+  git -C "$dir" rev-list --count "$upstream..HEAD" 2>/dev/null || printf '0\n'
+}
+
+state_path() {
+  printf '%s/%s\n' "$STATE_ROOT" "$1"
+}
+
+record_fetch() {
+  local dir="$1"
+  mkdir -p "$STATE_ROOT"
+  printf '%s\t%s\n' "$dir" "$(now_epoch)" >>"$(state_path fetch.tsv)"
+}
+
+# needs_fetch <repo_dir> - 0 when a fetch is due, 1 when still fresh.
+needs_fetch() {
+  local dir="$1" now last="" entry
+  [[ -f "$(state_path fetch.tsv)" ]] || return 0
+  now="$(now_epoch)"
+  while IFS= read -r entry || [[ -n "$entry" ]]; do
+    [[ "${entry%%$'\t'*}" == "$dir" ]] && last="${entry#*$'\t'}"
+  done <"$(state_path fetch.tsv)"
+  [[ -z "$last" || $(( now - last )) -ge $(( FETCH_MIN_HOURS * 3600 )) ]]
+}
+
+notify() {
+  local summary="$1" body="$2"
+  if [[ -n "$NOTIFY_COMMAND" ]]; then
+    summary="${summary//\"/\\\"}"
+    body="${body//\"/\\\"}"
+    eval "$NOTIFY_COMMAND" "\"$summary\"" "\"$body\"" || true
+  elif command -v notify-send >/dev/null 2>&1 && { [[ -n "${DISPLAY:-}" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; }; then
+    notify-send -u normal "$summary" "$body" || true
+  else
+    printf '%s\n' "[reposync] $summary: $body" >&2
+  fi
+}
+
+status() {
+  local dir name dirty since last unpushed now h
+  printf '%-40s %-10s %-12s %s\n' "REPOSITORY" "WORKTREE" "UNPUSHED" "LAST LOCAL WORK"
+  while IFS= read -r dir; do
+    [[ -d "$dir" ]] || continue
+    name="${dir##*/}"
+    dirty=""
+    git -C "$dir" status --porcelain 2>/dev/null | grep -q . && dirty="dirty"
+    since="$(unpushed_since "$dir")"
+    unpushed="$(unpushed_count "$dir")"
+    now="$(now_epoch)"
+    if [[ -n "$dirty" ]]; then
+      last="$(last_change_epoch "$dir")"
+      (( last > 0 )) || last="$now"
+    elif [[ "$since" != "0" ]]; then
+      last="$since"
+    else
+      last=0
+    fi
+    h=""
+    (( last > 0 )) && h="$(( (now - last) / 3600 ))h"
+    [[ "$unpushed" == "0" ]] && unpushed=""
+    printf '%-40s %-10s %-12s %s\n' "$name" "${dirty:-clean}" "$unpushed" "${h:-}"
+  done < <(repo_dirs)
+}
+
+# warn_stale - print (and notify) about work older than stale_hours that is
+# either uncommitted or unpushed. Never pushes, never commits.
+warn_stale() {
+  local dir name dirty since last now h notified cooldown found=0
+  now="$(now_epoch)"
+  while IFS= read -r dir; do
+    [[ -d "$dir" ]] || continue
+    name="${dir##*/}"
+    dirty=""
+    git -C "$dir" status --porcelain 2>/dev/null | grep -q . && dirty="dirty"
+    since="$(unpushed_since "$dir")"
+    last=0
+    [[ -n "$dirty" ]] && last="$(last_change_epoch "$dir")"
+    [[ "$last" == "0" && "$since" != "0" ]] && last="$since"
+    (( last > 0 )) || continue
+    h="$(( (now - last) / 3600 ))"
+    (( h >= STALE_HOURS )) || continue
+    notified="$(state_path "notified.$name")"
+    if [[ -f "$notified" ]]; then
+      cooldown="$(cat "$notified" 2>/dev/null || echo 0)"
+      (( now - cooldown < NOTIFY_COOLDOWN_HOURS * 3600 )) && continue
+    fi
+    found=1
+    printf 'STALE %s: uncommitted or unpushed work, %dh old\n' "$name" "$h"
+    notify "reposync: $name" "Has uncommitted or unpushed work for $h hours. Consider committing and pushing before shutdown."
+    mkdir -p "$STATE_ROOT"
+    printf '%s\n' "$now" >"$notified"
+  done < <(repo_dirs)
+  return "$found"
+}
+
+# sync - fetch remote refs (throttled) without touching the worktree.
+sync() {
+  local dir name
+  while IFS= read -r dir; do
+    [[ -d "$dir" ]] || continue
+    git -C "$dir" remote get-url origin >/dev/null 2>&1 || continue
+    name="${dir##*/}"
+    if needs_fetch "$dir"; then
+      printf 'fetch: %s\n' "$name"
+      git -C "$dir" fetch --prune origin 2>&1 | sed 's/^/  /' || true
+      record_fetch "$dir"
+    else
+      printf 'recent fetch, skipping: %s\n' "$name"
+    fi
+  done < <(repo_dirs)
+}
+
+install() {
+  local bin="$HOME/.local/bin/$PROGRAM" self config unit
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  mkdir -p "$(dirname "$bin")"
+  install -m 0755 "$self" "$bin"
+  [[ -f "$CONFIG_FILE" ]] || {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat >"$CONFIG_FILE" <<EOF
+# reposync configuration
+repo_root=$HOME/Documents/github
+# repo_root_append=$HOME/Documents/gitlab
+# repo_root_append=$HOME/Documents/forgejo
+stale_hours=8
+fetch_min_hours=6
+notify_cooldown_hours=24
+# notify_command=notify-send -u normal
+EOF
+  }
+  if [[ -d "$(dirname "${BASH_SOURCE[0]}")/systemd" ]]; then
+    mkdir -p "$HOME/.config/systemd/user"
+    local unit_root="$HOME/.config/systemd/user"
+    for name in reposync-warn.service reposync-warn.timer \
+                reposync-sync.service reposync-sync.timer \
+                reposync-session-end.service; do
+      unit="$(dirname "${BASH_SOURCE[0]}")/systemd/$name"
+      [[ -f "$unit" ]] || continue
+      sed "s|%BIN%|$bin|g" "$unit" >"$unit_root/$name"
+      chmod 0644 "$unit_root/$name"
+    done
+  fi
+  printf '%s: installed to %s\n' "$PROGRAM" "$bin"
+  printf '%s: config at %s\n' "$PROGRAM" "$CONFIG_FILE"
+  printf '%s: enable with: systemctl --user daemon-reload\n' "$PROGRAM"
+}
+
+usage() {
+  cat <<EOF
+Usage: $PROGRAM <command>
+
+Commands:
+  status        List every repo, worktree state, unpushed commits, age.
+  warn          Warn (stderr + notify) about work older than stale_hours
+                that is uncommitted or unpushed. Never commits or pushes.
+  sync          Fetch remote refs for every repo with a remote (throttled).
+  install       Install the script, config, and systemd units for this user.
+
+Config: $CONFIG_FILE (created by install if missing)
+  repo_root=<dir>            Directory of repositories (single root).
+  repo_root_append=<dir>     Additional repository root (repeatable).
+  stale_hours=<n>            Warn threshold for uncommitted/unpushed work.
+  fetch_min_hours=<n>        Minimum hours between fetches per repo.
+  notify_cooldown_hours=<n>  Minimum hours between warnings per repo.
+  notify_command=<cmd>       Override the notification command.
+EOF
+}
+
+load_config
+case "${1:-}" in
+  status) status ;;
+  warn) warn_stale || true ;;
+  sync) sync ;;
+  install) install ;;
+  --version) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
+  *) usage ;;
+esac

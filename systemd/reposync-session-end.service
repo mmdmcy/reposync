@@ -1,0 +1,15 @@
+[Unit]
+Description=reposync: warn about stale work at session end
+# Best-effort: runs when the user session ends (logout or system shutdown).
+# notify-send may be unavailable that late; the warning still reaches the
+# journal and is throttled by the cooldown state.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=%BIN% warn
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
