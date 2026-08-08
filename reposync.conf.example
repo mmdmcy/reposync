@@ -1,0 +1,22 @@
+# reposync configuration
+# Uncomment and adjust as needed.
+
+# Directories that contain one clone per repository. The first root is the
+# primary; repeat repo_root_append for every additional root (for example
+# gitlab and forgejo checkouts).
+repo_root=$HOME/Documents/github
+# repo_root_append=$HOME/Documents/gitlab
+# repo_root_append=$HOME/Documents/forgejo
+
+# Warn when uncommitted or unpushed work is at least this many hours old.
+stale_hours=8
+
+# Minimum hours between fetches of the same repository.
+fetch_min_hours=6
+
+# Minimum hours between warnings for the same repository.
+notify_cooldown_hours=24
+
+# Override the notification command. The summary and body are passed as two
+# arguments. Default: notify-send when a display is present.
+# notify_command=notify-send -u normal
