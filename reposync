@@ -17,6 +17,16 @@ FETCH_MIN_HOURS=6
 NOTIFY_COOLDOWN_HOURS=24
 NOTIFY_COMMAND=""
 
+# expand_home <path> - replace a leading ~ or a literal $HOME/${HOME} with the
+# home directory. Plain string substitution: no eval, nothing else expands.
+expand_home() {
+  local value="$1"
+  value="${value/#\~/$HOME}"
+  value="${value//\$\{HOME\}/$HOME}"
+  value="${value//\$HOME/$HOME}"
+  printf '%s\n' "$value"
+}
+
 load_config() {
   [[ -f "$CONFIG_FILE" ]] || return 0
   local line key value
@@ -31,8 +41,8 @@ load_config() {
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
     case "$key" in
-      repo_root) REPO_ROOTS=("$value") ;;
-      repo_root_append) REPO_ROOTS+=("$value") ;;
+      repo_root) REPO_ROOTS=("$(expand_home "$value")") ;;
+      repo_root_append) REPO_ROOTS+=("$(expand_home "$value")") ;;
       stale_hours) STALE_HOURS="$value" ;;
       fetch_min_hours) FETCH_MIN_HOURS="$value" ;;
       notify_cooldown_hours) NOTIFY_COOLDOWN_HOURS="$value" ;;
@@ -111,10 +121,20 @@ state_path() {
   printf '%s/%s\n' "$STATE_ROOT" "$1"
 }
 
+# record_fetch <repo_dir> - remember a successful fetch. Keeps one entry per
+# repo and at most 1000 lines, so the state file never grows without bound.
 record_fetch() {
-  local dir="$1"
+  local dir="$1" file tmp entry
+  file="$(state_path fetch.tsv)"
+  tmp="$file.tmp.$$"
   mkdir -p "$STATE_ROOT"
-  printf '%s\t%s\n' "$dir" "$(now_epoch)" >>"$(state_path fetch.tsv)"
+  if [[ -f "$file" ]]; then
+    while IFS= read -r entry || [[ -n "$entry" ]]; do
+      [[ "${entry%%$'\t'*}" == "$dir" ]] || printf '%s\n' "$entry"
+    done <"$file" | tail -n 999 >"$tmp"
+  fi
+  printf '%s\t%s\n' "$dir" "$(now_epoch)" >>"$tmp"
+  mv -f "$tmp" "$file"
 }
 
 # needs_fetch <repo_dir> - 0 when a fetch is due, 1 when still fresh.
@@ -131,9 +151,10 @@ needs_fetch() {
 notify() {
   local summary="$1" body="$2"
   if [[ -n "$NOTIFY_COMMAND" ]]; then
-    summary="${summary//\"/\\\"}"
-    body="${body//\"/\\\"}"
-    eval "$NOTIFY_COMMAND" "\"$summary\"" "\"$body\"" || true
+    # Only the configured command is parsed by eval; summary and body reach it
+    # as positional parameters, so repo names like '$(cmd)' are plain data.
+    set -- "$summary" "$body"
+    eval "$NOTIFY_COMMAND" '"$1"' '"$2"' || true
   elif command -v notify-send >/dev/null 2>&1 && { [[ -n "${DISPLAY:-}" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; }; then
     notify-send -u normal "$summary" "$body" || true
   else
@@ -141,7 +162,7 @@ notify() {
   fi
 }
 
-status() {
+cmd_status() {
   local dir name dirty since last unpushed now h
   printf '%-40s %-10s %-12s %s\n' "REPOSITORY" "WORKTREE" "UNPUSHED" "LAST LOCAL WORK"
   while IFS= read -r dir; do
@@ -199,7 +220,7 @@ warn_stale() {
 }
 
 # sync - fetch remote refs (throttled) without touching the worktree.
-sync() {
+cmd_sync() {
   local dir name
   while IFS= read -r dir; do
     [[ -d "$dir" ]] || continue
@@ -207,19 +228,22 @@ sync() {
     name="${dir##*/}"
     if needs_fetch "$dir"; then
       printf 'fetch: %s\n' "$name"
-      git -C "$dir" fetch --prune origin 2>&1 | sed 's/^/  /' || true
-      record_fetch "$dir"
+      if git -C "$dir" fetch --prune origin 2>&1 | sed 's/^/  /'; then
+        record_fetch "$dir"
+      else
+        printf 'fetch failed: %s (will retry next run)\n' "$name" >&2
+      fi
     else
       printf 'recent fetch, skipping: %s\n' "$name"
     fi
   done < <(repo_dirs)
 }
 
-install() {
+cmd_install() {
   local bin="$HOME/.local/bin/$PROGRAM" self config unit
   self="$(readlink -f "${BASH_SOURCE[0]}")"
   mkdir -p "$(dirname "$bin")"
-  install -m 0755 "$self" "$bin"
+  command install -m 0755 "$self" "$bin"
   [[ -f "$CONFIG_FILE" ]] || {
     mkdir -p "$(dirname "$CONFIG_FILE")"
     cat >"$CONFIG_FILE" <<EOF
@@ -273,10 +297,10 @@ EOF
 
 load_config
 case "${1:-}" in
-  status) status ;;
+  status) cmd_status ;;
   warn) warn_stale || true ;;
-  sync) sync ;;
-  install) install ;;
+  sync) cmd_sync ;;
+  install) cmd_install ;;
   --version) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
   *) usage ;;
 esac
