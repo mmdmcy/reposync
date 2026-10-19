@@ -1,7 +1,8 @@
 # reposync configuration
 # Uncomment and adjust as needed.
 
-# Directories that contain one clone per repository. The first root is the
+# Directories that contain one clone per repository. A leading ~ or a literal
+# $HOME is expanded; nothing else is. The first root is the
 # primary; repeat repo_root_append for every additional root (for example
 # gitlab and forgejo checkouts).
 repo_root=$HOME/Documents/github
